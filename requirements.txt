@@ -1,3 +1,5 @@
 dspy-ai
 openai
 fire
+typer
+pydantic
