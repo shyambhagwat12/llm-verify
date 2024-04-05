@@ -30,7 +30,7 @@ class Tool(BaseModel):
     name: str
     description: Optional[str] = None
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, expression, *args, **kwargs):
         raise NotImplementedError("Tool must implement the __call__ method")
 
 
