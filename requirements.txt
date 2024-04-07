@@ -3,3 +3,4 @@ openai
 fire
 typer
 pydantic
+pykka

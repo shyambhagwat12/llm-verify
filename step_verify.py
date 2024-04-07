@@ -1,26 +1,26 @@
 import re
 from enum import Enum
-import fire
+from typing import Annotated
 import dspy
 from dspy.predict import Retry
 from dspy.functional import TypedChainOfThought
-from dspy.pydantic import BaseModel, Field
-
-# from dspy.pydantic import BaseModel
 from dspy.primitives.assertions import assert_transform_module, backtrack_handler
+import typer
 
-models = {  # Active param count used as keys
-    "0.5": "qwen:0.5b",
-    "1.8": "qwen:latest",
-    "7:a": "meditron:7b",
-    "7:b": "mistral:v0.2",
-    "13": "mixtral:latest",
-    "35": "command-r:latest",
-    "70": "meditron:70b",
-}
+app = typer.Typer()
 
 
-class StepType(str, Enum):
+class LanguageModel(str, Enum):
+    M_0_5 = "qwen:0.5b"
+    M_1_8 = "qwen:latest"
+    M_7_A = "meditron:7b"
+    M_7_B = "mistral:v0.2"
+    M_13 = "mixtral:latest"
+    M_35 = "command-r:latest"
+    M_70 = "meditron:70b"
+
+
+class StepType(Enum):
     NECESSARY_ESSENTIAL_AND_VALID = "necessary_essential_valid"
     UNNECESSARY = "unnecessary"
     LOGICALLY_FALSE = "logically_false"
@@ -33,8 +33,43 @@ class StepVerfication(dspy.Signature):
     question: str = dspy.InputField()
     previous_step: str = dspy.InputField()
     current_step: str = dspy.InputField()
-    step_annotation: StepType = dspy.OutputField(
-        desc=f"Must be one of the following values: {StepType}"
+    step_annotation: str = dspy.OutputField(
+        desc=f"""Must be one of the following values: {
+            [item.value for item in StepType]}"""
+    )
+
+
+class MessageWithUnderstanding(dspy.BaseModel):
+    clear_rephrasing_of_message: str = dspy.Field(
+        description="Rephrase the user's question in clearer form. Leave it empty unless a rephrasing is useful."
+    )
+    why_is_user_asking_this: str = dspy.Field(
+        description="Why is the user asking this question at this point in the ongoing chat?"
+    )
+    what_is_user_objective: str = dspy.Field(
+        description="What are user's overall objectives implicit or explicit within this chat?"
+    )
+    question_decomposition: list[str] = dspy.Field(
+        description="Break down the question into simpler sub-questions."
+    )
+
+
+class UnderstandMessage(dspy.Signature):
+    chat: list[str] = dspy.InputField(desc="The conversational history till now")
+    new_message: str = dspy.InputField(desc="A new message by the user")
+    structured_message: MessageWithUnderstanding = dspy.OutputField(
+        desc="Message understood in terms of the underlying intent and objective"
+    )
+
+
+class ConversationalResponse(dspy.Signature):
+    raw_message_from_user: str = dspy.InputField()
+    structured_message: str = dspy.InputField()
+    rationale: str = dspy.InputField(
+        desc="Rationale behind the conversational response"
+    )
+    response_to_user: str = dspy.OutputField(
+        desc="Response to the user in a conversational style"
     )
 
 
@@ -42,8 +77,8 @@ class Task(dspy.Module):
     def __init__(self):
         self.generate = dspy.ChainOfThought("question -> answer")
 
-    def forward(self, input: str) -> dspy.Prediction:
-        answer = self.generate(question=input)
+    def forward(self, structured_message: MessageWithUnderstanding) -> dspy.Prediction:
+        answer = self.generate(question=str(structured_message))
         return answer
 
 
@@ -54,56 +89,94 @@ def rationale_to_steps(rationale: str) -> list[str]:
     return sentences
 
 
-class BaseAgent(dspy.Module):
-    def __init__(self):
+# class VerificationStrategy(Enum, str):
+#     LLM_AS_A_JUDGE = "llm_as_a_judge"
+#     CAPPY = "cappy"
+#     RM_MODEL = "rm_model"
+#     ROSCOE = "roscoe"
+#
+#
+# class StepVerifier:
+#     def __init__(self, strategy: VerificationStrategy):
+#         match strategy:
+#             case strategy.LLM_AS_A_JUDGE:
+#                 pass
+#
+#     def verify_steps(self, steps: list[str]):
+#         pass
+#
+
+
+class VerifiedQA(dspy.Module):
+    def __init__(self, verifier_model):
         super().__init__()
+        assert isinstance(
+            verifier_model, dspy.OllamaLocal
+        ), "Currently, a verifier model must be an ollama local model."
+        self.verifier_model = verifier_model
+        self.question_understanding = TypedChainOfThought(UnderstandMessage)
         self.task = Task()
         self.step_verifier = TypedChainOfThought(StepVerfication)
+        self.converational = TypedChainOfThought(ConversationalResponse)
 
     def forward(self, question: str) -> dspy.Prediction:
-        answer = self.task(question)
+        structured_message: MessageWithUnderstanding = self.question_understanding(
+            chat=[], new_message=question
+        ).structured_message
+        # print(structured_message)
+
+        answer = self.task(structured_message)
         steps = rationale_to_steps(answer.rationale)
 
-        previous_step = ""
-        for step in steps:
-            dspy.Suggest(
-                result=self.step_verifier(
-                    objective="Given a message from the user, come up with a reply by thinking step by step",
-                    question=question,
-                    previous_step=previous_step,
-                    current_step=step,
-                ).step_annotation
-                == StepType.NECESSARY_ESSENTIAL_AND_VALID,
-                msg="Each step in the thought process must be correct.",
-            )
-            previous_step = step
+        with dspy.context(lm=self.verifier_model):
+            previous_step = ""
+            for step in steps:
+                dspy.Suggest(
+                    result=self.step_verifier(
+                        objective=structured_message.what_is_user_objective,
+                        question=question,
+                        previous_step=previous_step,
+                        current_step=step,
+                    ).step_annotation
+                    != StepType.NECESSARY_ESSENTIAL_AND_VALID.value,
+                    msg="Each step in the thought process must be necessary for reaching an answer, and be logically and factually valid.",
+                )
+                print("Suggest Failed!")
+                previous_step = step
 
-        return answer
+        return self.converational(
+            raw_message_from_user=question,
+            structured_message=str(structured_message),
+            rationale=answer.answer,
+        )
 
 
-class AgentCLI(object):
-    """Optimize an agent, evaluate it, chat with it or deploy it."""
+@app.command()
+def chat(
+    question: str,
+    debug: Annotated[
+        bool, typer.Option(help="If debug, values should be printed to stdout.")
+    ] = False,
+    model: Annotated[
+        LanguageModel, typer.Option(help="Name of one of the local models.")
+    ] = LanguageModel.M_7_B,
+):
+    lm = dspy.OllamaLocal(model=model.value)
 
-    def __init__(self, model: str, debug: bool = False):
-        self.debug = bool(debug)
-        model = str(model)
-        if model not in models.keys():
-            raise ValueError(f"Model ({model}) must be one of {models.keys()}")
+    with dspy.context(lm=lm, trace=[]):
+        agent = assert_transform_module(
+            VerifiedQA(
+                verifier_model=dspy.OllamaLocal(model="command-r:latest")
+            ).map_named_predictors(Retry),
+            backtrack_handler,
+        )
+        response = agent(question)
 
-        self.lm = dspy.OllamaLocal(model=models[model])
+        print(response.response_to_user)
 
-    def chat(self, question: str):
-        with dspy.settings.context(lm=self.lm, trace=[]):
-            agent = assert_transform_module(
-                BaseAgent().map_named_predictors(Retry), backtrack_handler
-            )
-            response = agent(question)
-
-            print(response.answer)
-
-        if self.debug:
-            print(self.lm.inspect_history(n=5))
+    if debug:
+        print(lm.inspect_history(n=5))
 
 
 if __name__ == "__main__":
-    fire.Fire(AgentCLI)
+    app()
