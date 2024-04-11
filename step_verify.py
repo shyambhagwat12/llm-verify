@@ -1,15 +1,22 @@
+import functools
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk import trace as trace_sdk
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry import trace as trace_api
+from openinference.instrumentation.dspy import DSPyInstrumentor
+import phoenix
 import re
 import torch
+import tqdm
 from enum import Enum
-from typing import Annotated, Protocol, Tuple
+from typing import Annotated, Protocol, Tuple, Optional
 import dspy
 from dspy.predict import Retry
 from dspy.functional import TypedChainOfThought
 from dspy.primitives.assertions import assert_transform_module, backtrack_handler
 import typer
-from dsp import LM
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from dsp.modules.cache_utils import CacheMemory
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModel
+from concurrent.futures import ThreadPoolExecutor
 
 # TODO: Use Chat Adapters from dspy instead of manually formatting the chat
 
@@ -22,6 +29,17 @@ DEVICE = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
+
+
+phoenix.launch_app(host="localhost", port=6006)
+tracer_provider = trace_sdk.TracerProvider()
+tracer_provider.add_span_processor(
+    SimpleSpanProcessor(
+        span_exporter=OTLPSpanExporter(endpoint="http://localhost:6006/v1/traces")
+    )
+)
+trace_api.set_tracer_provider(tracer_provider=tracer_provider)
+DSPyInstrumentor().instrument()
 
 
 class LanguageModel(str, Enum):
@@ -56,6 +74,18 @@ class StepVerfication(dspy.Signature):
         desc=f"""Must be one of the following values: {
             [item.value for item in StepAnnotation]}"""
     )
+    step_rating: int = dspy.OutputField(
+        desc="""A rating between 0 to 5, expressing to what extent to which the given step is both essential and logically valid.
+
+Example: 
+    0 denotes 'certainly unnecessary and illogical'
+    1 denotes 'certainly unnecessary and most probably invalid'
+    2 denotes 'unnecessary and probably invalid'
+    3 denotes 'might be necessary and could be valid'
+    4 denotes 'seems somewhat necessary but appears valid'
+    5 denotes 'certainly necessary and logically sound'
+"""
+    )
 
 
 class MessageWithUnderstanding(dspy.BaseModel):
@@ -74,8 +104,7 @@ class MessageWithUnderstanding(dspy.BaseModel):
 
 
 class UnderstandMessage(dspy.Signature):
-    chat: list[str] = dspy.InputField(
-        desc="The conversational history till now")
+    chat: list[str] = dspy.InputField(desc="The conversational history till now")
     new_message: str = dspy.InputField(desc="A new message by the user")
     structured_message: MessageWithUnderstanding = dspy.OutputField(
         desc="Message understood in terms of the underlying intent and objective"
@@ -102,11 +131,13 @@ class Task(dspy.Module):
         return answer
 
 
-def rationale_to_steps(rationale: str) -> list[str]:
+def rationale_to_steps(rationale: str, max_spaces: int = 2) -> list[str]:
     pattern = r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s"
     sentences = re.split(pattern, rationale)
-    # print(sentences)
-    return sentences
+    filtered_list = [
+        sentence for sentence in sentences if sentence.count(" ") >= max_spaces
+    ]
+    return filtered_list
 
 
 class VerificationStrategy(str, Enum):
@@ -125,7 +156,7 @@ class StepVerifierType(Protocol):
         step_to_be_verified: str,
         reasoning_chain: list[str],
         chat_history: list[str] = [],
-    ) -> StepAnnotation:
+    ) -> Tuple[StepAnnotation, int]:
         """Verify this step, using this particular step verification method"""
         ...
 
@@ -145,29 +176,35 @@ class JudgeLmVerifier:
         step_to_be_verified: str,
         reasoning_chain: list[str],
         chat_history: list[str] = [],
-    ) -> StepAnnotation:
+    ) -> Tuple[StepAnnotation, int]:
         """Verify this step, using an LLM as a Judge"""
         with dspy.context(lm=self.lm):
-            annotation = self.llm_judge(
+            judgement = self.llm_judge(
                 objective=objective,
                 step_to_be_verified=step_to_be_verified,
                 reasoning_chain="\n  - ".join(reasoning_chain),
                 chat_history=chat_history,
-            ).step_annotation
+            )
 
-            print(annotation)
+            annotation, score = judgement.step_annotation, (judgement.step_rating * 0.2)
 
-            return annotation
+            print(annotation, score)
+
+            return annotation, score
 
 
 class BertClassifierVerifier:
-    def __init__(self, threshold: float = 0.7, debug: bool = True):
+    def __init__(
+        self,
+        tokenizer: AutoTokenizer,
+        model: AutoModel,
+        threshold: float = 0.7,
+        debug: bool = True,
+    ):
         self.debug = debug
         self.threshold = threshold
-        self.tokenizer = AutoTokenizer.from_pretrained("btan2/cappy-large")
-        self.cappy = AutoModelForSequenceClassification.from_pretrained(
-            "btan2/cappy-large"
-        ).to(DEVICE)
+        self.model = model
+        self.tokenizer = tokenizer
 
     @property
     def type(self) -> VerificationStrategy:
@@ -179,18 +216,17 @@ class BertClassifierVerifier:
         step_to_be_verified: str,
         reasoning_chain: list[str],
         chat_history: list[str] = [],
-    ) -> StepAnnotation:
+    ) -> Tuple[StepAnnotation, int]:
         """Verify this step, using this BERT based classification models such as Cappy"""
         instruction = f"""Does the following answer meet the objective behind user's messages?
 
         Objectives: {objective}
         """
-        instruction += "\n".join(chat_history +
-                                 [f"Answer: {step_to_be_verified}"])
+        instruction += "\n".join(chat_history + [f"Answer: {step_to_be_verified}"])
         response = step_to_be_verified
 
-        print(instruction) if self.debug else ...
-        print(response) if self.debug else ...
+        # print(instruction) if self.debug else ...
+        # print(response) if self.debug else ...
 
         inputs = self.tokenizer(
             [
@@ -198,14 +234,16 @@ class BertClassifierVerifier:
             ],
             return_tensors="pt",
         ).to(DEVICE)
-        print(len(inputs), inputs["input_ids"].shape)
-        score = self.cappy(**inputs).logits[0][0].item()
+        score = self.model(**inputs).logits[0][0].item()
 
         print(score)
         return (
-            StepAnnotation.DOES_NOT_SEEM_RIGHT
-            if score <= self.threshold
-            else StepAnnotation.ESSENTIAL_AND_VALID
+            (
+                StepAnnotation.DOES_NOT_SEEM_RIGHT
+                if score <= self.threshold
+                else StepAnnotation.ESSENTIAL_AND_VALID
+            ),
+            score,
         )
 
 
@@ -227,48 +265,63 @@ class BertClassifierVerifier:
 
 
 class VerifiedQA(dspy.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        step_verifier: StepVerifierType,
+        objective_verifier: Optional[StepVerifierType] = None,
+    ):
         super().__init__()
         self.message_understanding = TypedChainOfThought(UnderstandMessage)
         self.task = Task()
-        self.step_verifier = BertClassifierVerifier()
-        self.converational = TypedChainOfThought(ConversationalResponse)
-        self.objective_verifier = BertClassifierVerifier()
+        self.conversational = TypedChainOfThought(ConversationalResponse)
+
+        self.step_verifier = step_verifier
+        self.objective_verifier = (
+            step_verifier if objective_verifier == None else objective_verifier
+        )
 
     def forward(
         self, message: str, chat_history: list[str] = []
-    ) -> Tuple[list[str], dspy.Prediction]:
+    ) -> Tuple[list[Tuple[str, int]], dspy.Prediction]:
         structured_message: MessageWithUnderstanding = self.message_understanding(
             chat=chat_history, new_message=message
         ).structured_message
         # print(structured_message)
 
         # TODO: Format Chat and Chat history
-        chat_history.append(message)
+        # chat_history.append(message)
 
         answer = self.task(structured_message)
         steps = rationale_to_steps(answer.rationale)
 
+        dspy.Assert(
+            result=(len(steps) > 2),
+            msg="There should atleast be 2 steps in our rationale, or its probably not a good rationale.",
+        )
+
         print(f"{len(steps)=}")
 
-        chosen_steps = []
-
-        for step in steps:
+        def process_step(step):
+            annotation, score = self.step_verifier.verify_step(
+                objective=structured_message.what_is_user_objective,
+                chat_history=chat_history + [message],
+                reasoning_chain=steps,
+                step_to_be_verified=step,
+            )
             dspy.Suggest(
-                result=self.step_verifier.verify_step(
-                    objective=structured_message.what_is_user_objective,
-                    chat_history=chat_history,
-                    reasoning_chain=steps,
-                    step_to_be_verified=step,
-                )
-                == StepAnnotation.ESSENTIAL_AND_VALID.value,
-                msg="Each step in the thought process must be necessary for reaching an answer, and be logically and factually valid.",
+                result=annotation == StepAnnotation.ESSENTIAL_AND_VALID.value,
+                msg="Each step in the thought process must be necessary for reaching an answer and be logically and factually valid.",
             )
             print("Suggest Passed!")
+            return step, score
 
-            chosen_steps.append(step)
+        try:
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                chosen_steps = list(executor.map(process_step, steps))
+        except dspy.DSPySuggestionError as e:
+            raise e from e
 
-        response = self.converational(
+        response = self.conversational(
             raw_message_from_user=message,
             structured_message=str(structured_message),
             rationale=answer.answer,
@@ -282,13 +335,9 @@ class VerifiedQA(dspy.Module):
         )
 
         dspy.Suggest(
-            result=(objective_annotation ==
-                    StepAnnotation.ESSENTIAL_AND_VALID),
+            result=(objective_annotation == StepAnnotation.ESSENTIAL_AND_VALID),
             msg="The answer must meet the user's objectives.",
         )
-
-        print(objective_annotation)
-        print(response)
 
         return chosen_steps, response
 
@@ -297,8 +346,7 @@ class VerifiedQA(dspy.Module):
 def chat(
     message: str,
     debug: Annotated[
-        bool, typer.Option(
-            help="If debug, values should be printed to stdout.")
+        bool, typer.Option(help="If debug, values should be printed to stdout.")
     ] = False,
     model: Annotated[
         LanguageModel, typer.Option(help="Name of one of the local models.")
@@ -306,16 +354,28 @@ def chat(
 ):
     lm = dspy.OllamaLocal(model=model.value)
 
+    cappy_tokenizer = AutoTokenizer.from_pretrained("btan2/cappy-large")
+    cappy = AutoModelForSequenceClassification.from_pretrained("btan2/cappy-large").to(
+        DEVICE
+    )
+    cappy_verifier = BertClassifierVerifier(tokenizer=cappy_tokenizer, model=cappy)
+
+    # roscoe_tokenizer = AutoTokenizer.from_pretrained("facebook/roscoe-512-roberta-base")
+    # roscoe = AutoModelForSequenceClassification.from_pretrained(
+    #     "facebook/roscoe-512-roberta-base"
+    # ).to(DEVICE)
+    # roscoe_verifier = BertClassifierVerifier(tokenizer=roscoe_tokenizer, model=roscoe)
+
     with dspy.context(lm=lm, trace=[]):
-        print(CacheMemory)
         agent = assert_transform_module(
-            VerifiedQA().map_named_predictors(Retry),
-            backtrack_handler,
+            VerifiedQA(
+                step_verifier=cappy_verifier, objective_verifier=cappy_verifier
+            ).map_named_predictors(Retry),
+            functools.partial(backtrack_handler, max_backtracks=2),
         )
 
         reasoning, response = agent(message)
         print(response.response_to_user)
-
         print(reasoning)
 
     if debug:
@@ -326,12 +386,15 @@ def chat(
 def cappy(
     step: str,
     debug: Annotated[
-        bool, typer.Option(
-            help="If debug, values should be printed to stdout.")
+        bool, typer.Option(help="If debug, values should be printed to stdout.")
     ] = False,
 ):
-    cappy = BertClassifierVerifier()
+    cappy_tokenizer = AutoTokenizer.from_pretrained("btan2/cappy-large")
+    cappy_model = AutoModelForSequenceClassification.from_pretrained(
+        "btan2/cappy-large"
+    ).to(DEVICE)
 
+    cappy = BertClassifierVerifier(tokenizer=cappy_tokenizer, model=cappy_model)
     objective = "build a small rocket that can reach the moon"
 
     score = cappy.verify_step(

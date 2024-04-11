@@ -6,3 +6,7 @@ pydantic
 pykka
 transformers
 torch
+arize-phoenix 
+openinference-instrumentation-dspy 
+opentelemetry-exporter-otlp 
+opentelemetry-sdk
