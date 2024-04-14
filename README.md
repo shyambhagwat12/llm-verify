@@ -1,7 +1,7 @@
 # Verify-RCT Project
 
 ## Overview
-Verify-RCT leverages clinical trial data, integrating it into a Neo4j graph database and enriching nodes with embeddings from OpenAI's language models. This platform is designed to facilitate advanced analysis and visualization of relationships within medical data.
+Verify-RCT is designed to address  Evidence verification
 
 ## Components
 - **Neo4j Database**: Graph database for managing clinical trial information.
